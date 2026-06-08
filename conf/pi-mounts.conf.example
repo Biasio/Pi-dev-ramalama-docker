@@ -1,0 +1,23 @@
+# pi-mounts.conf — additional volumes for the pi-agent service.
+# One mount per line, compose volume syntax:
+#   HOST_PATH:CONTAINER_PATH[:OPTIONS]
+# HOST_PATH: absolute, or starting with ~ (expanded to $HOME).
+# OPTIONS: standard docker/podman volume flags, comma-separated
+#          (ro, rw, Z, z, ...). Omit for rw (add Z manually on Podman/SELinux
+#          if the target is not already covered by compose.yaml's defaults).
+#
+# Rendered into compose.mounts.override.yaml by `pi-ramalama --render-mounts`,
+# which `ensure_environment` calls automatically. MUST be current — and the
+# resulting container MUST be (re)started — before running
+# `pi-ramalama --install-extensions`, otherwise extension installers writing
+# to a path listed here will write into the container's ephemeral layer
+# instead (shadowed once the real mount is added later).
+#
+# Core mounts (pi-agent home dirs, settings.json, extensions volume) are
+# already defined in compose.yaml — do not duplicate them here. Use this
+# file only for additional, host-specific, or optional mounts (extra skill
+# packs, extension source trees you're developing against, shared caches).
+
+# Example:
+# ~/.config/cortexkit:/root/.config/cortexkit:Z
+

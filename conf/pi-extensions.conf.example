@@ -1,0 +1,21 @@
+# pi-extensions.conf — exact commands to install pi extensions/tooling
+# inside the pi-agent container, run interactively (TTY attached) in the
+# order listed, one `engine exec -it` invocation per line, so you can
+# follow and answer any interactive prompts each command produces.
+#
+# Rules:
+#   - One full shell command per line (it is passed to `bash -c "..."`).
+#   - Blank lines and lines starting with # are ignored.
+#   - Commands run with CWD=/root inside pi-agent, as root.
+#   - Run `pi-ramalama --render-mounts` (or just `pi-ramalama --start`/`--setup`,
+#     which call it) BEFORE `pi-ramalama --install-extensions`: mounts in
+#     pi-mounts.conf must exist on the container before extensions write
+#     into those paths, or the writes get shadowed when the mount is added
+#     afterwards.
+#   - Failure of one line does not stop the rest; failures are summarized
+#     at the end.
+
+# Example:
+# pi extensions install @earendil-works/example-extension
+# pi extensions list
+

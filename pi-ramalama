@@ -1,0 +1,98 @@
+#!/bin/bash
+# pi-ramalama — thin CLI dispatcher for the whole pi-dev-ramalama-docker setup.
+# It has no logic of its own: it parses the first argument, sources every
+# module in lib/, and calls the matching function. All actual behaviour
+# lives in:
+#   lib/common.sh      engine/compose detection, resolve_ramalama, render_mounts
+#   lib/env.sh          ensure_environment, remove_env
+#   lib/extensions.sh   install_extensions
+#   lib/model.sh         pull/benchmark/remove model, params bookkeeping
+#   lib/session.sh       start_env (TUI), start_rpc(_async), stop_rpc, cleanup
+#   lib/pi-wrapper.sh.tmpl  template for the host->container 'pi' proxy
+#   lib/parse_benchmark.py  parses optimus.py's "Best config: {...}" output
+set -e
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+DIR="$(dirname "$SCRIPT_PATH")"
+CONFIG_FILE="$DIR/conf/env.conf"
+MODELS_CONFIG_FILE="$DIR/conf/models.conf"
+
+for module in common env extensions model session; do
+    source "$DIR/lib/${module}.sh"
+done
+
+
+[ -f "$MODELS_CONFIG_FILE" ] || printf '%s\n' 'declare -A MODEL_PARAMS' > "$MODELS_CONFIG_FILE"
+declare -A MODEL_PARAMS
+[ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+source "$MODELS_CONFIG_FILE"
+
+check_dependencies || exit 1
+
+case "$1" in
+    --setup|--install)
+        ensure_environment
+        ;;
+    --render-mounts)
+        render_mounts
+        ;;
+    --install-extensions)
+        install_extensions
+        ;;
+    --start)
+        start_env "${@:2}"
+        ;;
+    --start-rpc)
+        start_rpc
+        ;;
+    --start-rpc-async)
+        start_rpc_async
+        ;;
+    --stop-rpc)
+        stop_rpc
+        ;;
+    --pull)
+        if [ -z "${2:-}" ]; then
+            echo "[Error] Missing model URI. Usage: $0 --pull <model_uri>"
+            exit 1
+        fi
+        pull_model "$2"
+        ;;
+    --benchmark)
+        benchmark_cli "${2:-}"
+        ;;
+    --rm-model)
+        remove_model
+        ;;
+    --remove)
+        remove_env
+        ;;
+    *)
+         cat << 'USAGE'
+Usage: pi-ramalama <command> [args]
+
+First-time setup, in order:
+  --setup                     bootstrap the host (dirs, pi wrapper, build image)
+  --pull <model_uri>          download a model via ramalama, optionally benchmark it
+  --install-extensions        run conf/pi-extensions.conf inside pi-agent (optional)
+  --start                     pick a model, serve it, attach to pi-agent in TUI
+
+Model management:
+  --benchmark [model_uri|idx] (re)run the isolated param benchmark on a pulled model
+  --rm-model                   remove a pulled model and its saved params
+
+RPC (used by the pi wrapper for VSCode; you normally don't call these directly):
+  --start-rpc                  blocking bootstrap, waits for the model to load
+  --start-rpc-async             non-blocking bootstrap, used by 'pi --mode rpc'
+  --stop-rpc                    tears down ramalama/pi-agent if no RPC session is left
+
+Maintenance:
+  --render-mounts               re-render conf/pi-mounts.conf into a compose override
+  --remove                      destroy containers, volumes and built images
+
+Config lives in conf/: copy the *.example files and edit them before
+running --setup. See README.md for the full picture.
+USAGE
+        exit 1
+        ;;
+esac
