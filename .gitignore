@@ -1,0 +1,7 @@
+# Config locali derivate dai template .conf.example in conf/
+conf/*.conf
+!conf/env.conf
+!conf/*.conf.example
+
+# Override generato automaticamente da render_mounts()
+compose.mounts.override.yaml

@@ -1,0 +1,64 @@
+# compose.yaml — the two services pi-ramalama orchestrates.
+# pi-agent is the long-lived coding-agent container (always part of
+# `compose up`). llama-optimus is a one-shot benchmark runner, gated
+# behind the "benchmark" profile so it never starts on a plain `compose up`
+# and only runs when lib/model.sh explicitly invokes it with
+# `--profile benchmark run --rm`. On Docker, compose.docker.yaml (if
+# present) is layered on top of this file; conf/pi-mounts.conf renders
+# into compose.mounts.override.yaml, layered on top of that.
+version: '3.8'
+
+services:
+  pi-agent:
+    build:
+      context: .
+      dockerfile: pi-dev/Dockerfile
+    image: pi-sandbox-image
+    container_name: pi-agent
+    networks:
+      - ai-net
+    ports:
+      - "${PI_RPC_PORT}:${PI_RPC_PORT}"
+    environment:
+      - PI_CACHE_RETENTION=long
+      - LLM_ENDPOINT=http://ramalama:${MODEL_PORT}/v1
+    volumes:
+      - ./.pi/workspace:/root/.pi/workspace:Z
+      - ~/.pi/settings.json:/root/.pi/settings.json:Z
+      - ~/.pi/agent:/root/.pi/agent:Z
+      - pi-extensions-volume:/root/.pi/agent/extensions
+    tty: true
+    stdin_open: true
+    entrypoint: ["sleep", "infinity"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "pi", "--version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  llama-optimus:
+    build:
+      context: ./optimus
+      dockerfile: Dockerfile
+      args:
+        OPTIMUS_COMMIT: ${OPTIMUS_COMMIT:-11ad87198e5cceb86d9fc0128960da7a24b0e89f}
+    image: llama-optimus-sandbox
+    container_name: llama-optimus
+    profiles: ["benchmark"]
+    networks:
+      - ai-net
+    environment:
+      - LLAMA_BIN=/usr/bin/
+      - MODEL_PATH=${MODEL_PATH_CONTAINER}
+    volumes:
+      - ${MODEL_DIR_HOST}:${MODEL_PATH_CONTAINER_DIR}:ro,Z
+
+networks:
+  ai-net:
+    name: ai-net
+    driver: bridge
+
+volumes:
+  pi-extensions-volume:
