@@ -20,10 +20,9 @@ services:
     ports:
       - "${PI_RPC_PORT}:${PI_RPC_PORT}"
     environment:
-      - PI_CACHE_RETENTION=long
       - LLM_ENDPOINT=http://ramalama:${MODEL_PORT}/v1
     volumes:
-      - ./.pi/workspace:/workspace:Z
+      - ${PI_RAMALAMA_WD}:/workspace:Z
       - ~/.pi/settings.json:/root/.pi/settings.json:Z
       - ~/.pi/agent:/root/.pi/agent:Z
       - pi-extensions-volume:/root/.pi/agent/extensions
