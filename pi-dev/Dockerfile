@@ -19,4 +19,9 @@ ARG PI_CODING_AGENT_VERSION=latest
 RUN npm install -g --ignore-scripts \
     @earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION}
 
+
+#Those env overrides must be after every npm/pip installation backed at image build time
+ENV NPM_CONFIG_PREFIX=/opt/npm-global-runtime
+ENV PATH="/opt/npm-global-runtime/bin:/root/.local/bin:${PATH}"
+
 WORKDIR /workspace

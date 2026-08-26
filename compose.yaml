@@ -26,6 +26,8 @@ services:
       - ~/.pi/settings.json:/root/.pi/settings.json:Z
       - ~/.pi/agent:/root/.pi/agent:Z
       - pi-extensions-volume:/root/.pi/agent/extensions
+      - pi-npm-global:/opt/npm-global-runtime
+      - pi-pip-user:/root/.local
     tty: true
     stdin_open: true
     entrypoint: ["sleep", "infinity"]
@@ -61,3 +63,5 @@ networks:
 
 volumes:
   pi-extensions-volume:
+  pi-npm-global:
+  pi-pip-user:
