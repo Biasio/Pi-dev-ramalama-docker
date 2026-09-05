@@ -1,23 +1,40 @@
 #!/bin/bash
 # lib/session.sh — interactive/RPC session lifecycle.
 
+# Per-session bookkeeping for the (possibly multiple) 'ramalama serve'
+# instances started by start_env().
+RAMALAMA_PIDS=()
+RAMALAMA_NAMES=()
+RAMALAMA_PORTS=()
+RAMALAMA_MODEL_URIS=()
+RAMALAMA_MODEL_NAMES=()
 
-# Tears down ramalama and pi-agent. Only registered inside start_env (the
-# interactive session), never globally, so it can't kill a persistent RPC
-# environment as a side effect of an unrelated command.
+# Tears down every RamaLama instance started this session, plus pi-agent
+# and the session's ephemeral artifacts. Only registered inside start_env,
+# never globally, so it can't kill a persistent RPC environment as a side
+# effect of an unrelated command.
 cleanup() {
     echo -e "\n[System] Shutting down..."
 
-    if [ -n "${RAMALAMA_PID:-}" ] && kill -0 "$RAMALAMA_PID" 2>/dev/null; then
-        echo "[Ramalama] Stopping PID $RAMALAMA_PID..."
-        kill "$RAMALAMA_PID" || true
-    fi
+    local pid
+    for pid in "${RAMALAMA_PIDS[@]}"; do
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "[Ramalama] Stopping PID $pid..."
+            kill "$pid" || true
+        fi
+    done
 
     echo "[Ramalama] Stopping remaining containers..."
+    local name
+    for name in "${RAMALAMA_NAMES[@]}"; do
+        $ENGINE stop "$name" >/dev/null 2>&1 || true
+    done
     ramalama stop --all >/dev/null 2>&1 || true
 
     echo "[Compose] Stopping pi-agent..."
     cd "$DIR" && compose stop >/dev/null 2>&1 || true
+
+    remove_session_artifacts
     exit 0
 }
 
@@ -32,23 +49,18 @@ resolve_model_env() {
     [ -n "$SPECIFIC_PARAMS" ] && COMBINED_ENV="${COMBINED_ENV},${SPECIFIC_PARAMS}"
 }
 
-# Builds the command with CPU pinning
-# opt-in via CPU_AFFINITY, any process-level env var via HK_SYSMEM, and any
-# other flag (--device, -t, --ngl, etc.) via RAMALAMA_ADDITIONAL_ARGS — all
-# defined in conf/env.conf / conf/user.env.conf.
-#
-# combined_env is a comma-joined "KEY=VAL,KEY=VAL,..." string. ramalama's
-# --env is `action='append'` (one podman/docker --env per invocation), so
-# each KEY=VAL pair must therefore be
-# passed as its own --env flag.
+# Launches one 'ramalama serve' instance under an explicit container name
+# and port, so multiple instances can run concurrently without colliding.
 _serve_ramalama() {
     local combined_env="$1"
     local model="$2"
+    local name="$3"
+    local port="$4"
 
     local -a cmd=(nice -n 10)
     [ -n "${CPU_AFFINITY:-}" ] && cmd+=(taskset -c "$CPU_AFFINITY")
 
-    cmd+=(ramalama serve --network ai-net --name ramalama
+    cmd+=(ramalama serve --network ai-net --name "$name"
           --image "$RAMALAMA_IMAGE" --rag-image "$RAMALAMA_RAG_IMAGE")
 
     local IFS=','
@@ -58,19 +70,17 @@ _serve_ramalama() {
     done
     unset IFS
 
-    cmd+=(-p "$MODEL_PORT")
-
+    cmd+=(-p "$port")
     [ -n "${RAMALAMA_ADDITIONAL_ARGS:-}" ] && cmd+=($RAMALAMA_ADDITIONAL_ARGS)
-
     cmd+=("$model")
 
-    RAMALAMA_SERVE_LOG="$(mktemp -t "$(date +"%Y%m%d-%H%M%S")-ramalama-XXXXXX.log")"
+    RAMALAMA_SERVE_LOG="$(mktemp -t "$(date +"%Y%m%d-%H%M%S")-${name}-XXXXXX.log")"
     "${cmd[@]}" >"$RAMALAMA_SERVE_LOG" 2>&1 &
 }
 
 # Waits for either the healthcheck to pass or the background 'ramalama
 # serve' process (RAMALAMA_PID, set by the caller right after
-# _serve_ramalama) to die
+# _serve_ramalama) to die.
 wait_for_ramalama() {
     local port="$1"
     local timeout="${2:-60}"
@@ -95,56 +105,100 @@ wait_for_ramalama() {
     return 0
 }
 
-# Interactive session: pick a model, serve it, launch pi-agent, attach in
-# TUI. Tears everything down on exit (see cleanup). RPC is not offered here.
+# Interactive multi-model picker: pick one model, then choose whether to
+# add another, continue with what's selected, or abort. Populates
+# SELECTED_MODEL_URIS on success; leaves it empty and returns 1 on abort
+# or when no models exist to choose from.
+select_models() {
+    SELECTED_MODEL_URIS=()
+
+    mapfile -t MODELS < <(ramalama list | awk 'NR>1 {print $1}')
+    if [ ${#MODELS[@]} -eq 0 ]; then
+        echo "[Error] No models found in RamaLama." >&2
+        return 1
+    fi
+
+    while true; do
+        echo
+        echo "Available models:"
+        for i in "${!MODELS[@]}"; do echo "  $((i+1))) ${MODELS[$i]}"; done
+        [ ${#SELECTED_MODEL_URIS[@]} -gt 0 ] && echo "Selected so far: ${SELECTED_MODEL_URIS[*]}"
+
+        read -p "Select a model to add [1-${#MODELS[@]}]: " SELECTION
+        local MODEL="${MODELS[$((SELECTION-1))]:-}"
+        if [ -z "$MODEL" ]; then
+            echo "[Error] Invalid selection."
+            continue
+        fi
+        SELECTED_MODEL_URIS+=("$MODEL")
+
+        echo
+        echo "  a) Add another model"
+        echo "  c) Continue with the ${#SELECTED_MODEL_URIS[@]} model(s) selected"
+        echo "  x) Abort"
+        read -p "Choice [a/c/x]: " NEXT
+        case "$NEXT" in
+            c|C) return 0 ;;
+            x|X) SELECTED_MODEL_URIS=(); return 1 ;;
+            *)   continue ;;
+        esac
+    done
+}
+
+# Interactive session: pick one or more models, serve each in its own
+# RamaLama instance on a randomized free port, expose all of them to
+# pi-agent via a session-only shadow models.json, attach in TUI. Tears
+# everything down together on exit.
 start_env() {
     trap cleanup EXIT SIGINT SIGTERM SIGHUP
 
     bootstrap_config
 
-    mapfile -t MODELS < <(ramalama list | awk 'NR>1 {print $1}')
-    [ ${#MODELS[@]} -eq 0 ] && echo "[Error] No models found in RamaLama." && exit 1
+    select_models || { echo "[Aborted] No models selected."; exit 1; }
 
-    for i in "${!MODELS[@]}"; do echo "$((i+1))) ${MODELS[$i]}"; done
-
-    read -p "Select the model to start: " SELECTION
-    local MODEL="${MODELS[$((SELECTION-1))]}"
-    [ -z "$MODEL" ] && exit 1
-
-    # pi.dev/docs/latest/usage#cli-reference: 'pi' with no args starts the
-    # TUI; any args passed to start_env (e.g. '--session <id>') are forwarded
-    # to the same 'pi' invocation so callers get the normal interactive
-    # bootstrap below (model picker, healthcheck, cleanup-on-exit) without
-    # going through RPC semantics/DEFAULT_RPC_MODEL.
     local PI_EXEC_CMD="pi $*"
 
-    local MODEL_NAME COMBINED_ENV
-    resolve_model_env "$MODEL"
+    local idx=0 MODEL NAME PORT
+    for MODEL in "${SELECTED_MODEL_URIS[@]}"; do
+        idx=$((idx + 1))
+        NAME="ramalama-${idx}"
 
-    if [ -z "${MODEL_PARAMS[$MODEL_NAME]:-}" ]; then
-        echo "[Notice] No MODEL_PARAMS entry for '$MODEL_NAME' in $CONFIG_FILE."
-        read -p "[Benchmark] Run llama-optimus now (isolated container) before starting? [y/N]: " RUN_BENCH_NOW
-        local SPECIFIC_PARAMS=""
-        if [[ "$RUN_BENCH_NOW" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-            if benchmark "$MODEL_NAME"; then
-                SPECIFIC_PARAMS="$LAST_BENCHMARK_PARAMS"
+        resolve_model_env "$MODEL"   # sets MODEL_NAME, COMBINED_ENV
+
+        if [ -z "${MODEL_PARAMS[$MODEL_NAME]:-}" ]; then
+            echo "[Notice] No MODEL_PARAMS entry for '$MODEL_NAME' in $CONFIG_FILE."
+            read -p "[Benchmark] Run llama-optimus now (isolated container) before starting? [y/N]: " RUN_BENCH_NOW
+            local SPECIFIC_PARAMS=""
+            if [[ "$RUN_BENCH_NOW" =~ ^([yY][eE][sS]|[yY])$ ]]; then
+                benchmark "$MODEL_NAME" && SPECIFIC_PARAMS="$LAST_BENCHMARK_PARAMS"
             fi
+            if [ -z "$SPECIFIC_PARAMS" ]; then
+                SPECIFIC_PARAMS="${DEFAULT_MODEL_PARAMS}"
+                echo "[System] Applying unoptimized default params: $SPECIFIC_PARAMS"
+            fi
+            update_model_params "$MODEL_NAME" "$SPECIFIC_PARAMS"
+            COMBINED_ENV="${DEFAULT_RAMALAMA_ENV}"
+            [ -n "$SPECIFIC_PARAMS" ] && COMBINED_ENV="${COMBINED_ENV},${SPECIFIC_PARAMS}"
         fi
-        if [ -z "$SPECIFIC_PARAMS" ]; then
-            SPECIFIC_PARAMS="${DEFAULT_MODEL_PARAMS}"
-            echo "[System] Applying unoptimized default params: $SPECIFIC_PARAMS"
-        fi
-        update_model_params "$MODEL_NAME" "$SPECIFIC_PARAMS"
-        COMBINED_ENV="${DEFAULT_RAMALAMA_ENV}"
-        [ -n "$SPECIFIC_PARAMS" ] && COMBINED_ENV="${COMBINED_ENV},${SPECIFIC_PARAMS}"
-    fi
 
-    echo "[Start] RamaLama -> $MODEL (HTTP port: $MODEL_PORT)"
-    _serve_ramalama "$COMBINED_ENV" "$MODEL"
-    RAMALAMA_PID=$!
+        PORT="$(find_free_port "$MODEL_PORT")" || exit 1
 
-    echo "[Healthcheck] Waiting for the L7 API (llama.cpp), timeout ${RAMALAMA_HEALTHCHECK_TIMEOUT:-60}s... (log: $RAMALAMA_SERVE_LOG)"
-    wait_for_ramalama "$MODEL_PORT" "${RAMALAMA_HEALTHCHECK_TIMEOUT:-60}" || exit 1
+        echo "[Start] RamaLama[$NAME] -> $MODEL (HTTP port: $PORT)"
+        _serve_ramalama "$COMBINED_ENV" "$MODEL" "$NAME" "$PORT"
+        RAMALAMA_PID="$!"
+
+        RAMALAMA_PIDS+=("$RAMALAMA_PID")
+        RAMALAMA_NAMES+=("$NAME")
+        RAMALAMA_PORTS+=("$PORT")
+        RAMALAMA_MODEL_URIS+=("$MODEL")
+        RAMALAMA_MODEL_NAMES+=("$MODEL_NAME")
+
+        echo "[Healthcheck] Waiting for $NAME, timeout ${RAMALAMA_HEALTHCHECK_TIMEOUT:-60}s... (log: $RAMALAMA_SERVE_LOG)"
+        wait_for_ramalama "$PORT" "${RAMALAMA_HEALTHCHECK_TIMEOUT:-60}" || exit 1
+    done
+
+    render_shadow_models_json || exit 1
+    render_session_override
 
     ensure_pi_agent_removed
     echo "[Compose] Starting pi-agent..."
@@ -155,8 +209,9 @@ start_env() {
 }
 
 # Non-interactive counterpart to start_env, for the 'pi --mode rpc' host
-# wrapper. The environment stays
-# up after this returns so later RPC calls can reuse it.
+# wrapper. Single-model only — explicitly out of scope for multi-instance
+# (see README's RPC section). The environment stays up after this returns
+# so later RPC calls can reuse it.
 start_rpc() {
     bootstrap_config
 
@@ -182,7 +237,7 @@ start_rpc() {
     resolve_model_env "$MODEL"
 
     echo "[RPC][Start] RamaLama -> $MODEL (HTTP port: $MODEL_PORT)"
-    _serve_ramalama "$COMBINED_ENV" "$MODEL"
+    _serve_ramalama "$COMBINED_ENV" "$MODEL" "ramalama" "$MODEL_PORT"
     RAMALAMA_PID=$!
     disown
 
@@ -214,7 +269,7 @@ start_rpc_async() {
             local MODEL_NAME COMBINED_ENV
             resolve_model_env "$MODEL"
             echo "[RPC][Async] Starting RamaLama -> $MODEL in the background (not waited on)..." >&2
-            _serve_ramalama "$COMBINED_ENV" "$MODEL"
+            _serve_ramalama "$COMBINED_ENV" "$MODEL" "ramalama" "$MODEL_PORT"
             disown
         fi
     fi

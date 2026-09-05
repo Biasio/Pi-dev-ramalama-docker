@@ -5,3 +5,7 @@ conf/*.conf
 
 # Override generato automaticamente da render_mounts()
 compose.mounts.override.yaml
+
+# Auto-generated per-session by 'pi-ramalama --start' (shadow models.json
+# mount) — torn down when the session ends
+compose.session.override.yaml

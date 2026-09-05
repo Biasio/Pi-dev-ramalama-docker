@@ -1,19 +1,23 @@
 #!/bin/bash
 # lib/common.sh — engine detection, the compose() wrapper, ramalama
-# resolution, and rendering of extra mounts. Sourced by ai-agent
+# resolution, port allocation, and shadow models.json generation.
 #
 # Picks Podman by default, falls back to Docker if podman isn't found,
-# and layers compose.mounts.override.yaml on top (if present) so extra
-# mounts from conf/pi-mounts.conf never override the base ones defined in
-# compose.yaml.
+# and layers compose.mounts.override.yaml and compose.session.override.yaml
+# on top (if present) so extra/session mounts never override the base ones
+# defined in compose.yaml.
 
 ENGINE="podman"
 COMPOSE_CMD="podman-compose"
-COMPOSE_FILES=(-f "$DIR/compose.yaml")
 
 command -v podman &> /dev/null || { ENGINE="docker"; COMPOSE_CMD="docker compose"; }
-[ -f "$DIR/compose.mounts.override.yaml" ] && COMPOSE_FILES+=(-f "$DIR/compose.mounts.override.yaml")
-compose() { $COMPOSE_CMD "${COMPOSE_FILES[@]}" "$@"; }
+
+compose() {
+    local files=(-f "$DIR/compose.yaml")
+    [ -f "$DIR/compose.mounts.override.yaml" ]  && files+=(-f "$DIR/compose.mounts.override.yaml")
+    [ -f "$DIR/compose.session.override.yaml" ] && files+=(-f "$DIR/compose.session.override.yaml")
+    $COMPOSE_CMD "${files[@]}" "$@"
+}
 
 # Makes sure 'ramalama' is resolvable even when the calling process (e.g.
 # VSCode spawning the pi wrapper) doesn't inherit the interactive shell's
@@ -39,7 +43,6 @@ resolve_ramalama() {
     echo "        Set RAMALAMA_BIN_DIR in env.conf to its install directory." >&2
     return 1
 }
-
 
 bootstrap_config() {
     resolve_ramalama || exit 1
@@ -107,5 +110,137 @@ ensure_pi_agent_removed() {
     if $ENGINE ps -a --format '{{.Names}}' 2>/dev/null | grep -qx pi-agent \
        && ! $ENGINE ps --format '{{.Names}}' 2>/dev/null | grep -qx pi-agent; then
         $ENGINE rm -f pi-agent >/dev/null 2>&1 || true
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Port allocation for concurrent 'ramalama serve' instances
+# ---------------------------------------------------------------------------
+
+# Tests whether TCP port $1 on localhost is currently free.
+port_is_free() {
+    local port="$1"
+    if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+        exec 3>&- 2>/dev/null
+        return 1
+    fi
+    return 0
+}
+
+# Picks a free TCP port
+find_free_port() {
+    local base="$1"
+    local range="${2:-2000}"
+    local attempts="${3:-30}"
+    local port
+    for ((i = 0; i < attempts; i++)); do
+        port=$((base + (RANDOM % range)))
+        [ "$port" -lt 1024 ] && continue
+        if port_is_free "$port"; then
+            echo "$port"
+            return 0
+        fi
+    done
+    echo "[Error] Could not find a free port within ${range} of ${base} after ${attempts} attempts." >&2
+    return 1
+}
+
+REAL_MODELS_JSON="$HOME/.pi/agent/models.json"
+
+# Builds a temporary models.json: the real one (if present) plus one
+# provider entry per RamaLama instance started this session, added only
+# when no existing provider entry already carries that instance's
+# baseUrl. The merge runs inside pi-sandbox-image (already built, already
+# has python3 per pi-dev/Dockerfile) — no host jq/python3 dependency.
+# Sets SESSION_MODELS_JSON on success; caller must check the return code.
+render_shadow_models_json() {
+    local MERGE_DIR
+    MERGE_DIR="$(mktemp -d -t pi-ramalama-models-XXXXXX)" || return 1
+    SESSION_MODELS_JSON="$MERGE_DIR/models.json"
+
+    local NEW_PROVIDERS_JSON="[" sep="" i
+    for i in "${!RAMALAMA_NAMES[@]}"; do
+        NEW_PROVIDERS_JSON+="${sep}{\"key\":\"session-${RAMALAMA_NAMES[$i]}\",\"baseUrl\":\"http://${RAMALAMA_NAMES[$i]}:${RAMALAMA_PORTS[$i]}/v1\",\"model\":\"${RAMALAMA_MODEL_NAMES[$i]}\"}"
+        sep=","
+    done
+    NEW_PROVIDERS_JSON+="]"
+    echo "$NEW_PROVIDERS_JSON" > "$MERGE_DIR/new_providers.json"
+
+    cat > "$MERGE_DIR/merge.py" << 'PYEOF'
+import json, pathlib, sys
+
+base_path = pathlib.Path("/base/models.json")
+new_path = pathlib.Path("/work/new_providers.json")
+out_path = pathlib.Path("/work/models.json")
+
+data = {"providers": {}}
+if base_path.exists():
+    try:
+        data = json.loads(base_path.read_text())
+    except json.JSONDecodeError as exc:
+        print(f"[Warning] Real models.json is not valid JSON, starting from empty: {exc}", file=sys.stderr)
+        data = {"providers": {}}
+data.setdefault("providers", {})
+
+# skip any session instance whose endpoint is already
+# registered under any existing provider key, whatever that key is named.
+existing_base_urls = {
+    p.get("baseUrl") for p in data["providers"].values() if isinstance(p, dict)
+}
+
+added = 0
+for entry in json.loads(new_path.read_text()):
+    if entry["baseUrl"] in existing_base_urls:
+        continue
+    data["providers"][entry["key"]] = {
+        "baseUrl": entry["baseUrl"],
+        "api": "openai-completions",
+        "apiKey": "not-needed",
+        "models": [{"id": entry["model"], "name": entry["model"]}],
+    }
+    added += 1
+
+out_path.write_text(json.dumps(data, indent=2))
+print(f"[Merge] {added} new provider(s) added, {len(data['providers'])} total.", file=sys.stderr)
+PYEOF
+
+    local -a MOUNTS=(-v "$MERGE_DIR:/work:Z")
+    [ -f "$REAL_MODELS_JSON" ] && MOUNTS+=(-v "$REAL_MODELS_JSON:/base/models.json:ro,Z")
+
+    if ! $ENGINE run --rm "${MOUNTS[@]}" --entrypoint python3 pi-sandbox-image /work/merge.py; then
+        echo "[Error] Failed to build shadow models.json." >&2
+        rm -rf "$MERGE_DIR"
+        SESSION_MODELS_JSON=""
+        return 1
+    fi
+    echo "[Session] Shadow models.json ready (${#RAMALAMA_NAMES[@]} session provider(s) considered) -> $SESSION_MODELS_JSON"
+}
+
+# Renders an ephemeral compose override that shadows
+# /root/.pi/agent/models.json with the merged file above, read-only, for
+# this session's pi-agent container only — same layering mechanism
+# conf/pi-mounts.conf already uses (target is a file inside a mounted
+# directory, more specific than the directory mount, so it takes
+# precedence). Never edits conf/pi-mounts.conf or the real models.json.
+render_session_override() {
+    local OUT="$DIR/compose.session.override.yaml"
+    {
+        echo "# Auto-generated per-session by pi-ramalama. Ephemeral — torn"
+        echo "# down with the session. Do not edit or commit."
+        echo "services:"
+        echo "  pi-agent:"
+        echo "    volumes:"
+        echo "      - ${SESSION_MODELS_JSON}:/root/.pi/agent/models.json:ro,Z"
+    } > "$OUT"
+    echo "[Session] Mounted shadow models.json for this session."
+}
+
+# Removes the ephemeral compose override and the temp dir holding the
+# merged models.json. Safe to call even if neither was ever created.
+remove_session_artifacts() {
+    rm -f "$DIR/compose.session.override.yaml"
+    if [ -n "${SESSION_MODELS_JSON:-}" ]; then
+        rm -rf "$(dirname "$SESSION_MODELS_JSON")" 2>/dev/null || true
+        SESSION_MODELS_JSON=""
     fi
 }
