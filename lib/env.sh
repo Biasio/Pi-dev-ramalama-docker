@@ -16,6 +16,7 @@ ensure_environment() {
         "$HOME/.local/share/cortexkit/magic-context"
         "$HOME/.local/bin"
 	"$PI_RAMALAMA_WD"
+        "$PI_RAMALAMA_WD/.pi"
     )
 
     for dir in "${REQUIRED_DIRS[@]}"; do

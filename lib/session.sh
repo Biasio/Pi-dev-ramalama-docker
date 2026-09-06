@@ -198,6 +198,7 @@ start_env() {
     done
 
     render_shadow_models_json || exit 1
+    render_session_settings || exit 1
     render_session_override
 
     ensure_pi_agent_removed

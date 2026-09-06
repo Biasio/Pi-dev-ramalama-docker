@@ -231,9 +231,12 @@ render_session_override() {
         echo "  pi-agent:"
         echo "    volumes:"
         echo "      - ${SESSION_MODELS_JSON}:/root/.pi/agent/models.json:ro,Z"
+        [ -n "${SESSION_SETTINGS_JSON:-}" ] && \
+            echo "      - ${SESSION_SETTINGS_JSON}:/workspace/.pi/settings.json:ro,Z"
     } > "$OUT"
-    echo "[Session] Mounted shadow models.json for this session."
+    echo "[Session] Mounted shadow models.json${SESSION_SETTINGS_JSON:+ and project settings.json} for this session."
 }
+
 
 # Removes the ephemeral compose override and the temp dir holding the
 # merged models.json. Safe to call even if neither was ever created.
@@ -243,4 +246,56 @@ remove_session_artifacts() {
         rm -rf "$(dirname "$SESSION_MODELS_JSON")" 2>/dev/null || true
         SESSION_MODELS_JSON=""
     fi
+    if [ -n "${SESSION_SETTINGS_JSON:-}" ]; then
+        rm -rf "$(dirname "$SESSION_SETTINGS_JSON")" 2>/dev/null || true
+        SESSION_SETTINGS_JSON=""
+    fi
+}
+
+
+
+REAL_PROJECT_SETTINGS_JSON="$PI_RAMALAMA_WD/.pi/settings.json"
+
+# Generates an ephemeral project-level settings.json: the real project
+# settings.json (if present) with defaultModel pinned to the first model
+# selected this session. Relies on the same containerized-merge pattern as
+# render_shadow_models_json so a user-authored
+# .pi/settings.json is preserved verbatim except for that
+# one key. Sets SESSION_SETTINGS_JSON on success.
+render_session_settings() {
+    local MERGE_DIR
+    MERGE_DIR="$(mktemp -d -t pi-ramalama-settings-XXXXXX)" || return 1
+    SESSION_SETTINGS_JSON="$MERGE_DIR/settings.json"
+
+    cat > "$MERGE_DIR/merge.py" << 'PYEOF'
+import json, pathlib, sys
+
+base_path = pathlib.Path("/base/settings.json")
+out_path = pathlib.Path("/work/settings.json")
+default_model = sys.argv[1]
+
+data = {}
+if base_path.exists():
+    try:
+        data = json.loads(base_path.read_text())
+    except json.JSONDecodeError as exc:
+        print(f"[Warning] Real project settings.json is not valid JSON, starting from empty: {exc}", file=sys.stderr)
+        data = {}
+
+data["defaultModel"] = default_model
+out_path.write_text(json.dumps(data, indent=2))
+print(f"[Merge] Project settings.json defaultModel -> {default_model}", file=sys.stderr)
+PYEOF
+
+    local -a MOUNTS=(-v "$MERGE_DIR:/work:Z")
+    [ -f "$REAL_PROJECT_SETTINGS_JSON" ] && MOUNTS+=(-v "$REAL_PROJECT_SETTINGS_JSON:/base/settings.json:ro,Z")
+
+    if ! $ENGINE run --rm "${MOUNTS[@]}" --entrypoint python3 pi-sandbox-image \
+        /work/merge.py "${RAMALAMA_MODEL_NAMES[0]}"; then
+        echo "[Error] Failed to build shadow project settings.json." >&2
+        rm -rf "$MERGE_DIR"
+        SESSION_SETTINGS_JSON=""
+        return 1
+    fi
+    echo "[Session] Shadow project settings.json ready -> $SESSION_SETTINGS_JSON"
 }
